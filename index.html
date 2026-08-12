@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>KoiNoi</title>
+
+    <style>
+        :root {
+            --w: 1200;
+            --h: 900;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 24px;
+            background: #111;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+
+        .stage-wrap {
+            width: min(100%, calc((100vh - 48px) * (var(--w) / var(--h))));
+            max-width: calc(var(--w) * 1px);
+            min-width: 200px;
+            margin: 0 auto;
+        }
+
+        .stage {
+            position: relative;
+            width: 100%;
+            aspect-ratio: var(--w) / var(--h);
+            overflow: hidden;
+            border-radius: 14px;
+            background: #1c1c1c;
+            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+            touch-action: none;
+            user-select: none;
+        }
+
+        .layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            object-position: center;
+            transform-origin: center;
+            will-change: transform;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        .layer-multiply {
+            mix-blend-mode: multiply;
+            opacity: 1.0;
+        }
+
+        #mainCanvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="stage-wrap">
+        <div class="stage" id="stage">
+            <canvas id="mainCanvas" width="1200" height="900"></canvas>
+
+            <img src="mod.gif" class="layer layer-multiply" alt="">
+        </div>
+    </div>
+    <script src="imagesData.js"></script>
+    <script>
+        (function () {
+            const stage = document.getElementById('stage');
+            const canvas = document.getElementById('mainCanvas');
+            const ctx = canvas.getContext('2d');
+
+            // Offscreen canvas dùng cho Pixel-Perfect Hit Testing
+            const hitCanvas = document.createElement('canvas');
+            hitCanvas.width = 1200;
+            hitCanvas.height = 900;
+            const hitCtx = hitCanvas.getContext('2d', { willReadFrequently: true });
+
+            // Offscreen canvas dùng cho Clipping Mask của Mắt
+            const eyeClipCanvas = document.createElement('canvas');
+            eyeClipCanvas.width = 1200;
+            eyeClipCanvas.height = 900;
+            const eyeClipCtx = eyeClipCanvas.getContext('2d');
+
+            const EYE_CONFIG = { centerX: 600, centerY: 300, maxRadius: 6 };
+            const MAX_DRAG_DIST = 150;
+            const MIN_EXTRA_LENGTH = 2000;
+            const THREAD_COUNT = 7;
+            const THREAD_MIN_Y = 150;
+            const THREAD_MAX_Y = 800;
+
+            let isDragging = false;
+            let dragSource = null;
+            let startStageX = 0;
+            let currentOffset = 0;
+            let dragStartOffset = 0;
+
+            let targetEye = { x: 0, y: 0 };
+            let currentEye = { x: 0, y: 0 };
+
+            const images = {};
+            const imageSources = {
+                bg: IMAGE_DATA.Background,
+                shade: IMAGE_DATA.Shade,
+                inside: IMAGE_DATA.Inside,
+                eyeBound: IMAGE_DATA.Eye_Bound,
+                eye: IMAGE_DATA.Eye,
+                leftShadow: IMAGE_DATA.Left_Shadow,
+                rightShadow: IMAGE_DATA.Right_Shadow,
+                left: IMAGE_DATA.Left,
+                right: IMAGE_DATA.Right,
+            };
+
+            let loadedCount = 0;
+            const totalImages = Object.keys(imageSources).length;
+
+            let threads = [];
+
+            for (let key in imageSources) {
+                images[key] = new Image();
+                images[key].src = imageSources[key];
+                images[key].onload = () => {
+                    loadedCount++;
+                    if (loadedCount === totalImages) {
+                        init();
+                    }
+                };
+            }
+
+            function init() {
+                setupThreads();
+                requestAnimationFrame(renderLoop);
+            }
+
+            function setupThreads() {
+                const minY = THREAD_MIN_Y, maxY = THREAD_MAX_Y;
+                const numThreads = THREAD_COUNT;
+                const stepY = (maxY - minY) / (numThreads + 1);
+
+                const leftAnchors = [];
+                const rightAnchors = [];
+
+                for (let i = 1; i <= numThreads; i++) {
+                    const targetY = Math.round(minY + stepY * i);
+                    leftAnchors.push({ x: 520, y: targetY });
+                    rightAnchors.push({ x: 620, y: targetY });
+                }
+
+                for (let i = rightAnchors.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [rightAnchors[i], rightAnchors[j]] = [rightAnchors[j], rightAnchors[i]];
+                }
+
+                threads = [];
+                for (let i = 0; i < numThreads; i++) {
+                    const pLeft = leftAnchors[i];
+                    const pRight = rightAnchors[i];
+                    const initialDist = Math.hypot(pRight.x - pLeft.x, pRight.y - pLeft.y);
+
+                    threads.push({
+                        localLeftX: pLeft.x,
+                        localLeftY: pLeft.y,
+                        localRightX: pRight.x,
+                        localRightY: pRight.y,
+                        totalLength: initialDist + MIN_EXTRA_LENGTH,
+                        curveFactor1: (Math.random() - 0.5) * 1.5,
+                        curveFactor2: (Math.random() - 0.5) * 1.5,
+                        phaseShift: Math.random() * Math.PI * 2,
+                        cp1: { x: 0, y: 0 },
+                        cp2: { x: 0, y: 0 },
+                        leftPt: { x: 0, y: 0 },
+                        rightPt: { x: 0, y: 0 }
+                    });
+                }
+            }
+
+            // Vẽ hiệu ứng Glitch nhiễu tuần hoàn Tím - Xanh Lá - Đen cho dây
+            function drawGlitchThreads(time) {
+                // Đổi màu chủ đạo theo chu kỳ thời gian
+                const cycle = (time * 0.0003) % (Math.PI * 2);
+                const isGlitching = Math.random() < 0.05; // Tần suất giật gián đoạn
+
+                threads.forEach((t, index) => {
+                    const lx = t.localLeftX - currentOffset;
+                    const ly = t.localLeftY;
+                    const rx = t.localRightX + currentOffset;
+                    const ry = t.localRightY;
+
+                    const straightDist = Math.hypot(rx - lx, ry - ly);
+                    const slack = Math.max(0, t.totalLength - straightDist);
+                    const sagDepth = Math.pow(slack, 0.78) * 0.7;
+
+                    const pulseMulplier = 2.5 + 0.5 * Math.sin(time * 0.002 + index);
+                    const pulse = Math.sin(time * 0.003 + t.phaseShift) * 3 * pulseMulplier;
+
+                    const cp1x = lx + (rx - lx) * 0.35 + (t.curveFactor1 * sagDepth * 0.25);
+                    const cp1y = ly + sagDepth * 0.8 + pulse + (t.curveFactor1 * 20);
+
+                    const cp2x = lx + (rx - lx) * 0.65 + (t.curveFactor2 * sagDepth * 0.25);
+                    const cp2y = ry + sagDepth * 0.8 - pulse + (t.curveFactor2 * 20);
+
+                    t.leftPt = { x: lx, y: ly };
+                    t.rightPt = { x: rx, y: ry };
+                    t.cp1 = { x: cp1x, y: cp1y };
+                    t.cp2 = { x: cp2x, y: cp2y };
+
+                    // Bóng sợi dây
+                    ctx.beginPath();
+                    ctx.moveTo(lx, ly + 3);
+                    ctx.bezierCurveTo(cp1x, cp1y + 3, cp2x, cp2y + 3, rx, ry + 3);
+                    ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+
+                    // Độ lệch vị trí ngẫu nhiên khi có hiệu ứng glitch
+                    const offsetX = isGlitching ? (Math.random() - 0.5) * 6 : 0;
+                    const offsetY = isGlitching ? (Math.random() - 0.5) * 4 : 0;
+
+                    // Pass 1: Lớp dây nền Đen
+                    ctx.beginPath();
+                    ctx.moveTo(lx, ly);
+                    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, rx, ry);
+                    ctx.strokeStyle = '#000000';
+                    ctx.lineWidth = 3;
+                    ctx.stroke();
+
+                    // Pass 2: Lớp Chromatic Tím
+                    const purpleColor = `rgba(180, 0, 255, ${0.7 + 0.3 * Math.sin(cycle + index)})`;
+                    ctx.beginPath();
+                    ctx.moveTo(lx - 1.5 + offsetX, ly - 1 + offsetY);
+                    ctx.bezierCurveTo(cp1x - 1.5 + offsetX, cp1y - 1 + offsetY, cp2x - 1.5 + offsetX, cp2y - 1 + offsetY, rx - 1.5 + offsetX, ry - 1 + offsetY);
+                    ctx.strokeStyle = purpleColor;
+                    ctx.lineWidth = 1.8;
+                    ctx.stroke();
+
+                    // Pass 3: Lớp Chromatic Xanh Lá
+                    const greenColor = `rgba(0, 255, 100, ${0.7 + 0.3 * Math.cos(cycle + index)})`;
+                    ctx.beginPath();
+                    ctx.moveTo(lx + 1.5 - offsetX, ly + 1 - offsetY);
+                    ctx.bezierCurveTo(cp1x + 1.5 - offsetX, cp1y + 1 - offsetY, cp2x + 1.5 - offsetX, cp2y + 1 - offsetY, rx + 1.5 - offsetX, ry + 1 - offsetY);
+                    ctx.strokeStyle = greenColor;
+                    ctx.lineWidth = 1.8;
+                    ctx.stroke();
+
+                    // Pass 4: Vạch nhiễu đứt đoạn (Glitch Lines)
+                    if (isGlitching) {
+                        ctx.save();
+                        ctx.setLineDash([Math.random() * 20 + 5, Math.random() * 15 + 5]);
+                        ctx.beginPath();
+                        ctx.moveTo(lx + offsetX * 2, ly + offsetY * 2);
+                        ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, rx + offsetX * 2, ry + offsetY * 2);
+                        ctx.strokeStyle = Math.random() > 0.5 ? '#00ff66' : '#bf00ff';
+                        ctx.lineWidth = 2.5;
+                        ctx.stroke();
+                        ctx.restore();
+                    }
+                });
+            }
+
+            // Vẽ mắt bị Clip bên trong Eye_Bound.png
+            function drawClippedEye() {
+                eyeClipCtx.clearRect(0, 0, 1200, 900);
+
+                // 1. Vẽ mặt đệm Mask (Eye_Bound.png)
+                eyeClipCtx.drawImage(images.eyeBound, 0, 0, 1200, 900);
+
+                // 2. Thiết lập chế độ giao cắt source-in
+                eyeClipCtx.globalCompositeOperation = 'source-in';
+
+                // 3. Vẽ con mắt di chuyển theo Offset
+                eyeClipCtx.drawImage(images.eye, currentEye.x, currentEye.y, 1200, 900);
+
+                // Reset composite operation
+                eyeClipCtx.globalCompositeOperation = 'source-over';
+
+                // 4. Đưa hình ảnh mắt đã clipped ra Main Canvas
+                ctx.drawImage(eyeClipCanvas, 0, 0, 1200, 900);
+            }
+
+            function renderLoop(timestamp) {
+                ctx.clearRect(0, 0, 1200, 900);
+
+                currentEye.x += (targetEye.x - currentEye.x) * 0.15;
+                currentEye.y += (targetEye.y - currentEye.y) * 0.15;
+
+                // 1. Nền bên dưới
+                ctx.drawImage(images.bg, 0, 0, 1200, 900);
+                ctx.drawImage(images.shade, -currentOffset, 0, 1200, 900);
+                ctx.drawImage(images.inside, 0, 0, 1200, 900);
+
+                // 2. Mắt bị clipped bởi Eye_Bound
+                drawClippedEye();
+
+                // 3. Dây chỉ với hiệu ứng Glitch Tím - Xanh Lá - Đen
+                drawGlitchThreads(timestamp || 0);
+
+                // 4. Hai ảnh Left_Shadow và Right_Shadow với chế độ Multiply
+                ctx.save();
+                ctx.globalCompositeOperation = 'multiply';
+                ctx.drawImage(images.leftShadow, -currentOffset, 0, 1200, 900);
+                ctx.drawImage(images.rightShadow, currentOffset, 0, 1200, 900);
+                ctx.restore();
+
+                // 5. Hai mảnh Left / Right che lên trên cùng
+                ctx.drawImage(images.left, -currentOffset, 0, 1200, 900);
+                ctx.drawImage(images.right, currentOffset, 0, 1200, 900);
+
+                requestAnimationFrame(renderLoop);
+            }
+
+            function getStagePos(e) {
+                const rect = canvas.getBoundingClientRect();
+                const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+                const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+                return {
+                    x: (clientX - rect.left) * (1200 / rect.width),
+                    y: (clientY - rect.top) * (900 / rect.height)
+                };
+            }
+
+            // Hit test Pixel-Perfect trực tiếp trên hình Left.png và Right.png
+            function checkHitRegion(x, y) {
+                const px = Math.floor(x);
+                const py = Math.floor(y);
+
+                if (px < 0 || px >= 1200 || py < 0 || py >= 900) return null;
+
+                // Kiểm tra mảnh bên Trái (Left.png)
+                hitCtx.clearRect(0, 0, 1200, 900);
+                hitCtx.drawImage(images.left, -currentOffset, 0, 1200, 900);
+                let alphaLeft = hitCtx.getImageData(px, py, 1, 1).data[3];
+                if (alphaLeft > 10) return 'left';
+
+                // Kiểm tra mảnh bên Phải (Right.png)
+                hitCtx.clearRect(0, 0, 1200, 900);
+                hitCtx.drawImage(images.right, currentOffset, 0, 1200, 900);
+                let alphaRight = hitCtx.getImageData(px, py, 1, 1).data[3];
+                if (alphaRight > 10) return 'right';
+
+                return null;
+            }
+
+            function onPointerDown(e) {
+                const pos = getStagePos(e);
+                const hitTarget = checkHitRegion(pos.x, pos.y);
+
+                if (hitTarget) {
+                    isDragging = true;
+                    dragSource = hitTarget;
+                    startStageX = pos.x;
+                    dragStartOffset = currentOffset;
+                    stage.style.cursor = 'grabbing';
+                }
+            }
+
+            function onPointerMove(e) {
+                const pos = getStagePos(e);
+                updateEyePosition(pos.x, pos.y);
+
+                if (!isDragging) {
+                    const hitTarget = checkHitRegion(pos.x, pos.y);
+                    stage.style.cursor = hitTarget ? 'grab' : 'default';
+                    return;
+                }
+
+                const deltaStageX = pos.x - startStageX;
+
+                let newOffset = (dragSource === 'left')
+                    ? dragStartOffset - deltaStageX
+                    : dragStartOffset + deltaStageX;
+
+                currentOffset = Math.max(0, Math.min(MAX_DRAG_DIST, newOffset));
+            }
+
+            function onPointerUp() {
+                if (isDragging) {
+                    isDragging = false;
+                    dragSource = null;
+                    stage.style.cursor = 'default';
+                }
+            }
+
+            function updateEyePosition(cursorX, cursorY) {
+                const dx = cursorX - EYE_CONFIG.centerX;
+                const dy = cursorY - EYE_CONFIG.centerY;
+
+                const percentX = Math.max(-1, Math.min(1, dx / EYE_CONFIG.centerX));
+                const percentY = Math.max(-1, Math.min(1, dy / EYE_CONFIG.centerY));
+
+                let rawTargetX = percentX * EYE_CONFIG.maxRadius;
+                let rawTargetY = percentY * EYE_CONFIG.maxRadius;
+
+                const distFromCenter = Math.hypot(rawTargetX, rawTargetY);
+                if (distFromCenter > EYE_CONFIG.maxRadius) {
+                    const angle = Math.atan2(rawTargetY, rawTargetX);
+                    rawTargetX = Math.cos(angle) * EYE_CONFIG.maxRadius;
+                    rawTargetY = Math.sin(angle) * EYE_CONFIG.maxRadius;
+                }
+
+                targetEye.x = rawTargetX;
+                targetEye.y = rawTargetY;
+            }
+
+            stage.addEventListener('mousedown', onPointerDown);
+            window.addEventListener('mousemove', onPointerMove);
+            window.addEventListener('mouseup', onPointerUp);
+
+            stage.addEventListener('touchstart', onPointerDown, { passive: true });
+            window.addEventListener('touchmove', onPointerMove, { passive: true });
+            window.addEventListener('touchend', onPointerUp);
+        })();
+    </script>
+</body>
+
+</html>
